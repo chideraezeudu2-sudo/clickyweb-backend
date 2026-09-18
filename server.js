@@ -7,17 +7,28 @@ import { getUsage, incrementUsage, setPlan, getPlanForInstall } from './usage-st
 const app = express()
 const PORT = process.env.PORT || 3000
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
+// Generic upstream LLM config — defaults to Cerebras's free tier (OpenAI-compatible,
+// supports tool calling) so this can be swapped back to OpenRouter/a paid provider
+// later just by changing env vars, no code changes needed.
+const LLM_BASE_URL = process.env.LLM_BASE_URL || 'https://api.cerebras.ai/v1/chat/completions'
+const LLM_API_KEY = process.env.LLM_API_KEY || process.env.CEREBRAS_API_KEY
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null
 
+// Vision fallback — a separate, always-paid-tier provider since Cerebras's free
+// models are text-only. Used only when DOM-selector clicking can't find something
+// (canvas apps, custom-drawn UI). Kept as its own provider config so it can point
+// at any OpenAI-vision-compatible endpoint independent of the main chat provider.
+const VISION_BASE_URL = process.env.VISION_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions'
+const VISION_API_KEY = process.env.VISION_API_KEY
+const VISION_MODEL = process.env.VISION_MODEL || 'openai/gpt-4o-mini'
+
 // Plan limits — actions (agent tool-calls/messages) per rolling 30-day period.
-// Matches the pricing tiers from the original pitch: Free / Basic Pro / Power Agent.
 const PLAN_LIMITS = {
-  free: { label: 'Free', monthlyActions: 5, priceId: null },
-  basic: { label: 'Basic Pro', monthlyActions: 150, priceId: process.env.STRIPE_PRICE_BASIC || null },
-  power: { label: 'Power Agent', monthlyActions: Infinity, priceId: process.env.STRIPE_PRICE_POWER || null },
+  free: { label: 'Free', monthlyActions: 10, priceId: null, visionFallback: false },
+  plus: { label: 'Plus', monthlyActions: 150, priceId: process.env.STRIPE_PRICE_PLUS || null, visionFallback: false },
+  pro: { label: 'Pro', monthlyActions: 400, priceId: process.env.STRIPE_PRICE_PRO || null, visionFallback: false },
+  pro_plus: { label: 'Pro+', monthlyActions: 1000, priceId: process.env.STRIPE_PRICE_PROPLUS || null, visionFallback: true },
 }
 
 app.use(cors())
@@ -42,7 +53,7 @@ app.post('/billing/webhook', express.raw({ type: 'application/json' }), async (r
       const session = event.data.object
       const installId = session.client_reference_id
       const plan = session.metadata?.plan
-      if (installId && (plan === 'basic' || plan === 'power')) {
+      if (installId && (plan === 'plus' || plan === 'pro' || plan === 'pro_plus')) {
         await setPlan(installId, plan, session.subscription, session.customer)
       }
     }
@@ -84,7 +95,7 @@ app.post('/billing/create-checkout-session', async (req, res) => {
   const installId = req.header('x-install-id')
   const { plan } = req.body
   if (!installId) return res.status(400).json({ error: 'Missing X-Install-Id header' })
-  if (plan !== 'basic' && plan !== 'power') return res.status(400).json({ error: 'Invalid plan' })
+  if (!['plus', 'pro', 'pro_plus'].includes(plan)) return res.status(400).json({ error: 'Invalid plan' })
 
   const priceId = PLAN_LIMITS[plan].priceId
   if (!priceId) {
@@ -108,6 +119,84 @@ app.post('/billing/create-checkout-session', async (req, res) => {
 })
 
 /**
+ * Vision fallback — locates an element by natural-language description using a
+ * vision-capable model, for pages where DOM-selector clicking can't find anything
+ * (canvas apps, custom-drawn UI). Gated to plans that include it (Pro+ by default).
+ */
+app.post('/v1/vision-locate', async (req, res) => {
+  const installId = req.header('x-install-id')
+  if (!installId) return res.status(400).json({ error: { message: 'Missing X-Install-Id header.' } })
+
+  const plan = await getPlanForInstall(installId)
+  const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free
+  if (!limits.visionFallback) {
+    return res.status(402).json({
+      error: {
+        message: `Vision fallback isn't included in the ${limits.label} plan. Upgrade to Pro+ to enable it.`,
+        code: 'VISION_REQUIRES_UPGRADE',
+      },
+    })
+  }
+
+  if (!VISION_API_KEY) {
+    return res.status(500).json({ error: { message: 'Server is not configured with a vision API key.' } })
+  }
+
+  const { imageDataUrl, description } = req.body
+  if (!imageDataUrl || !description) {
+    return res.status(400).json({ error: { message: 'Missing imageDataUrl or description.' } })
+  }
+
+  let upstream
+  try {
+    upstream = await fetch(VISION_BASE_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${VISION_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: VISION_MODEL,
+        max_tokens: 200,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text:
+                  `Find the on-screen element described as: "${description}". ` +
+                  'Look at the attached screenshot and reply with ONLY compact JSON, no markdown, no explanation: ' +
+                  '{"found": boolean, "x": <pixel center x>, "y": <pixel center y>, "label": "<short text/description of what is actually there>"}. ' +
+                  'Coordinates must be pixel positions matching the exact width/height of the attached image.',
+              },
+              { type: 'image_url', image_url: { url: imageDataUrl } },
+            ],
+          },
+        ],
+      }),
+    })
+  } catch (err) {
+    console.error('Vision upstream fetch failed:', err)
+    return res.status(502).json({ error: { message: 'Could not reach the vision provider.' } })
+  }
+
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => '')
+    return res.status(upstream.status).json({ error: { message: `Vision provider error: ${text}` } })
+  }
+
+  const data = await upstream.json()
+  const raw = data?.choices?.[0]?.message?.content || ''
+  const cleaned = raw.replace(/```json|```/g, '').trim()
+
+  try {
+    const parsed = JSON.parse(cleaned)
+    return res.json(parsed)
+  } catch {
+    console.error('Could not parse vision model response:', raw)
+    return res.json({ found: false })
+  }
+})
+
+/**
  * The core proxy: forwards chat completion requests to OpenRouter using our own
  * server-held key, after checking the caller hasn't exceeded their plan's limit.
  * Request/response shape is passed through untouched (including streaming), so
@@ -116,13 +205,13 @@ app.post('/billing/create-checkout-session', async (req, res) => {
  */
 app.post('/v1/chat/completions', async (req, res) => {
   const installId = req.header('x-install-id')
-  const userKey = req.header('x-user-openrouter-key') // optional BYOK escape hatch
+  const userKey = req.header('x-user-llm-key') // optional BYOK escape hatch
 
   if (!installId && !userKey) {
     return res.status(400).json({ error: { message: 'Missing X-Install-Id header.' } })
   }
 
-  let authKey = OPENROUTER_API_KEY
+  let authKey = LLM_API_KEY
 
   if (userKey) {
     // Power users who bring their own OpenRouter key skip our limits entirely.
@@ -145,24 +234,22 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 
   if (!authKey) {
-    return res.status(500).json({ error: { message: 'Server is not configured with an OpenRouter API key.' } })
+    return res.status(500).json({ error: { message: 'Server is not configured with an LLM API key.' } })
   }
 
   let upstream
   try {
-    upstream = await fetch(OPENROUTER_URL, {
+    upstream = await fetch(LLM_BASE_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${authKey}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://clickyweb.app',
-        'X-Title': 'ClickyWeb',
       },
       body: JSON.stringify(req.body),
     })
   } catch (err) {
     console.error('Upstream fetch failed:', err)
-    return res.status(502).json({ error: { message: 'Could not reach OpenRouter.' } })
+    return res.status(502).json({ error: { message: 'Could not reach the LLM provider.' } })
   }
 
   res.status(upstream.status)
