@@ -23,6 +23,36 @@ const VISION_BASE_URL = process.env.VISION_BASE_URL || 'https://openrouter.ai/ap
 const VISION_API_KEY = process.env.VISION_API_KEY
 const VISION_MODEL = process.env.VISION_MODEL || 'openai/gpt-4o-mini'
 
+// Older extension builds shipped model IDs the upstream provider has since retired
+// (llama-3.3-70b-versatile et al.), which surfaced to users as a hard 404 on every
+// message. Extensions already installed in a browser can't be updated remotely, so
+// translate known-retired IDs here instead of forwarding them. Any unrecognized ID
+// falls back to the default rather than failing, since this endpoint is a fixed-menu
+// proxy rather than a pass-through to the provider's full catalog.
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'openai/gpt-oss-120b'
+const MODEL_ALIASES = {
+  'llama-3.3-70b-versatile': 'openai/gpt-oss-120b',
+  'llama-3.3-70b': 'openai/gpt-oss-120b',
+  'llama-3.1-8b-instant': 'openai/gpt-oss-20b',
+  'gpt-oss-120b': 'openai/gpt-oss-120b',
+  'gpt-oss-20b': 'openai/gpt-oss-20b',
+  'qwen-3-32b': 'qwen/qwen3.8-27b',
+  'qwen3-32b': 'qwen/qwen3.8-27b',
+}
+const ALLOWED_MODELS = new Set([
+  'openai/gpt-oss-120b',
+  'openai/gpt-oss-20b',
+  'qwen/qwen3.8-27b',
+  'allam-2-7b',
+  'groq/compound',
+])
+
+function resolveModel(requested) {
+  if (typeof requested !== 'string' || !requested) return DEFAULT_MODEL
+  if (ALLOWED_MODELS.has(requested)) return requested
+  return MODEL_ALIASES[requested] || DEFAULT_MODEL
+}
+
 // Plan limits — actions (agent tool-calls/messages) per rolling 30-day period.
 const PLAN_LIMITS = {
   free: { label: 'Free', monthlyActions: 10, priceId: null, visionFallback: false },
@@ -239,13 +269,17 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   let upstream
   try {
+    const resolvedModel = resolveModel(req.body?.model)
+    if (resolvedModel !== req.body?.model) {
+      console.log(`[model] ${req.body?.model ?? '(none)'} -> ${resolvedModel}`)
+    }
     upstream = await fetch(LLM_BASE_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${authKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify({ ...req.body, model: resolvedModel }),
     })
   } catch (err) {
     console.error('Upstream fetch failed:', err)
