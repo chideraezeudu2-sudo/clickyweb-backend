@@ -24,6 +24,12 @@ const VISION_BASE_URL = process.env.VISION_BASE_URL || 'https://openrouter.ai/ap
 const VISION_API_KEY = process.env.VISION_API_KEY
 const VISION_MODEL = process.env.VISION_MODEL || 'openai/gpt-4o-mini'
 
+// Optional — TypeSafe's Jev, used for the agent's fast "what next?" decision.
+// Leave unset to keep decision mode off; the client falls back to the chat model.
+const JEV_BASE_URL = process.env.JEV_BASE_URL || 'https://api.typesafe.ai/v1/systemone'
+const JEV_API_KEY = process.env.TYPESAFE_API_KEY
+const JEV_MODEL = process.env.JEV_MODEL || 'jev-latest'
+
 // Older extension builds shipped model IDs the upstream provider has since retired
 // (llama-3.3-70b-versatile et al.), which surfaced to users as a hard 404 on every
 // message. Extensions already installed in a browser can't be updated remotely, so
@@ -279,6 +285,86 @@ app.post('/v1/vision-locate', async (req, res) => {
     return res.json({ found: false })
   }
 })
+
+/**
+ * Fast decision endpoint backed by TypeSafe's Jev (a "System One" model). Jev
+ * does not generate text — it picks one option from a set you declare and
+ * returns calibrated probabilities, which makes it far cheaper and faster than
+ * a chat model for the agent's "what do I do next?" step.
+ *
+ * The extension decides when to use this; the backend only proxies. When no key
+ * is configured the endpoint reports 501 so the client can fall back to the
+ * chat model instead of the user hitting an error.
+ */
+app.post('/v1/decide', async (req, res) => {
+  const installId = req.header('x-install-id')
+  if (!installId) return res.status(400).json({ error: { message: 'Missing X-Install-Id header.' } })
+
+  if (!JEV_API_KEY) {
+    return res.status(501).json({
+      error: {
+        message: 'Fast decision mode is not configured on this server.',
+        code: 'JEV_NOT_CONFIGURED',
+      },
+    })
+  }
+
+  const { state, question, options } = req.body ?? {}
+  if (!state || !question || !Array.isArray(options) || options.length < 2) {
+    return res.status(400).json({
+      error: { message: 'Requires state, question, and at least two options.' },
+    })
+  }
+
+  let upstream
+  try {
+    upstream = await fetch(JEV_BASE_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${JEV_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: JEV_MODEL,
+        state,
+        questions: {
+          next: {
+            type: 'choice',
+            instructions: question,
+            // Jev answers with one of these labels, so no JSON parsing is needed.
+            criteria: Object.fromEntries(options.map((option) => [option, option])),
+          },
+        },
+      }),
+    })
+  } catch (err) {
+    console.error('Jev upstream fetch failed:', err)
+    return res.status(502).json({ error: { message: 'Could not reach the decision provider.' } })
+  }
+
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => '')
+    console.error(`Jev upstream ${upstream.status}:`, text.slice(0, 500))
+    // 429 is Jev's rate limit; the client should retry against the chat model.
+    return res.status(upstream.status === 429 ? 503 : 502).json({
+      error: { message: `Decision provider error (${upstream.status}).`, code: 'JEV_UPSTREAM_ERROR' },
+    })
+  }
+
+  const data = await upstream.json()
+  const answer = data?.answers?.next
+  const choice = answer?.choice
+
+  if (!choice || !options.includes(choice)) {
+    console.error('Unexpected Jev response shape:', JSON.stringify(data).slice(0, 500))
+    return res.status(502).json({ error: { message: 'Decision provider returned an unusable answer.', code: 'JEV_BAD_ANSWER' } })
+  }
+
+  res.json({ choice, confidence: answer?.confidence ?? null, model: data?.model ?? JEV_MODEL })
+})
+
+/** Cheap probe so the extension can feature-detect decision mode once per session */
+app.get('/v1/decide/available', (_req, res) => res.json({ available: Boolean(JEV_API_KEY) }))
 
 /**
  * The core proxy: forwards chat completion requests to OpenRouter using our own
