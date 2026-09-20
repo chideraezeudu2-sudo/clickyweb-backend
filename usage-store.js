@@ -143,12 +143,16 @@ async function sbSetPlan(installId, plan, subscriptionId, customerId, bySubscrip
  * Probe the backing table once at startup so /health reports the store actually
  * in use rather than just whether credentials are present. Without this the
  * service looks persistent until the first request happens to fail over.
+ *
+ * Reads rather than going through getUsage, which would insert a row for the
+ * probe's own id and leave a junk record behind on every boot.
  */
 export async function initUsageStore() {
   if (!useSupabase) return usageStoreStatus()
 
   try {
-    await sbGetUsage('__startup_probe__')
+    const { error } = await supabase.from(TABLE).select('install_id').limit(1)
+    if (error) throw error
     console.log(`[usage-store] Using Supabase table '${TABLE}'. Usage will persist across deploys.`)
   } catch (err) {
     const message = err?.message || String(err)
