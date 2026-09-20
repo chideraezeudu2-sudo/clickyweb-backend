@@ -1,0 +1,48 @@
+name: Keep Render warm
+
+# Render's free instance sleeps after ~15 minutes idle, so the first request after
+# a pause waits 30-60s for the container to boot. Pinging well inside that window
+# keeps it resident, which removes that wait from the user's first message.
+#
+# GitHub's scheduler is best-effort and can lag by several minutes under load, so
+# the interval is deliberately shorter than Render's idle timeout. If this proves
+# unreliable, a paid instance or an external uptime pinger is the sturdier fix.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+jobs:
+  # A cold start can take longer than a single request's timeout, so waking the
+  # service is a separate step from verifying it. A failed wake-up must not fail
+  # the run — that would email a failure on every cold boot, which is noise.
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake the service
+        continue-on-error: true
+        run: |
+          curl -sS -o /dev/null --max-time 120 \
+            https://clickyweb-backend.onrender.com/health || true
+
+      - name: Verify /health
+        run: |
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 60 \
+              https://clickyweb-backend.onrender.com/health || echo 000)
+            echo "attempt $attempt -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Backend did not answer 200 after 3 attempts" >&2
+          exit 1

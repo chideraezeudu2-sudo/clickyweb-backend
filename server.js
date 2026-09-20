@@ -2,7 +2,8 @@ import express from 'express'
 import cors from 'cors'
 import Stripe from 'stripe'
 import { Readable } from 'node:stream'
-import { getUsage, incrementUsage, setPlan, getPlanForInstall } from './usage-store.js'
+import { createHash } from 'node:crypto'
+import { getUsage, incrementUsage, setPlan, getPlanForInstall, usageStoreStatus, initUsageStore } from './usage-store.js'
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -53,7 +54,58 @@ function resolveModel(requested) {
   return MODEL_ALIASES[requested] || DEFAULT_MODEL
 }
 
-// Plan limits — actions (agent tool-calls/messages) per rolling 30-day period.
+// ---- Usage accounting ----
+//
+// The agent loop makes one request per tool-call round trip, so counting every
+// request would charge a single user command ten times over. Charge once per
+// task instead: a fresh user turn ends with a 'user' message, while each further
+// round trip of the same task ends with the 'tool' result it just appended. So
+// only a transcript ending in a user message opens a new task. (The client doesn't
+// send a conversation id, so the transcript shape is the signal available.)
+//
+// The same transcript can also arrive twice in a row when the client's streaming
+// attempt fails and it retries without streaming, so remember what was just
+// charged and treat an identical retry as the same task.
+const RETRY_WINDOW_MS = 60 * 1000
+const recentCharges = new Map()
+
+// Hash the whole transcript, not just the opening message: two different turns in
+// the same conversation share a first user message, but a retry resends the exact
+// same array, so only an identical resend should collapse.
+function transcriptFingerprint(installId, messages) {
+  return createHash('sha256')
+    .update(`${installId}\u0000${JSON.stringify(messages ?? [])}`)
+    .digest('hex')
+}
+
+function opensNewTask(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return true
+  return messages[messages.length - 1]?.role === 'user'
+}
+
+/** True when this request should consume one unit of the caller's quota */
+function shouldChargeRequest(installId, messages) {
+  if (!opensNewTask(messages)) return false
+
+  const fingerprint = transcriptFingerprint(installId, messages)
+  const chargedAt = recentCharges.get(fingerprint)
+  if (chargedAt && Date.now() - chargedAt < RETRY_WINDOW_MS) return false
+
+  recentCharges.set(fingerprint, Date.now())
+  return true
+}
+
+/** Drop expired fingerprints so the map doesn't grow without bound */
+function pruneRecentCharges() {
+  const cutoff = Date.now() - RETRY_WINDOW_MS
+  for (const [fingerprint, chargedAt] of recentCharges) {
+    if (chargedAt < cutoff) recentCharges.delete(fingerprint)
+  }
+}
+setInterval(pruneRecentCharges, RETRY_WINDOW_MS).unref()
+
+// Plan limits — tasks (one user command, however many tool round trips it needs)
+// per rolling 30-day period.
 const PLAN_LIMITS = {
   free: { label: 'Free', monthlyActions: 10, priceId: null, visionFallback: false },
   plus: { label: 'Plus', monthlyActions: 150, priceId: process.env.STRIPE_PRICE_PLUS || null, visionFallback: false },
@@ -101,9 +153,11 @@ app.post('/billing/webhook', express.raw({ type: 'application/json' }), async (r
 
 app.use(express.json({ limit: '2mb' }))
 
-app.get('/health', (_req, res) => res.json({ ok: true }))
+// Including the usage-store driver makes a misconfigured deploy visible from
+// outside, instead of only in the Render logs.
+app.get('/health', (_req, res) => res.json({ ok: true, usageStore: usageStoreStatus() }))
 
-/** Current plan + usage for an install — the extension polls this to show "X of Y actions used" */
+/** Current plan + usage for an install — the extension polls this to show "X of Y tasks used" */
 app.get('/usage', async (req, res) => {
   const installId = req.header('x-install-id')
   if (!installId) return res.status(400).json({ error: 'Missing X-Install-Id header' })
@@ -251,16 +305,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free
     const usage = await getUsage(installId)
 
+    // Checked on every request so a mid-task loop can't run past the limit, but
+    // only a new task actually consumes quota.
     if (usage.count >= limits.monthlyActions) {
       return res.status(429).json({
         error: {
-          message: `You've used all ${limits.monthlyActions} actions on the ${limits.label} plan this period. Upgrade for more.`,
+          message: `You've used all ${limits.monthlyActions} tasks on the ${limits.label} plan this period. Upgrade for more.`,
           code: 'PLAN_LIMIT_REACHED',
         },
       })
     }
 
-    await incrementUsage(installId)
+    if (shouldChargeRequest(installId, req.body?.messages)) {
+      await incrementUsage(installId)
+    }
   }
 
   if (!authKey) {
@@ -300,6 +358,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   Readable.fromWeb(upstream.body).pipe(res)
 })
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`ClickyWeb backend listening on port ${PORT}`)
+  await initUsageStore()
 })
