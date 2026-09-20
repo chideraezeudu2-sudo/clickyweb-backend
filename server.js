@@ -54,6 +54,37 @@ const ALLOWED_MODELS = new Set([
   'groq/compound',
 ])
 
+/**
+ * How long the client should wait before retrying a provider-throttled request.
+ *
+ * The provider's own retry-after can be far shorter than the time its token
+ * budget actually takes to refill — Groq advertises 5s while the reset counter
+ * runs for another 30s — and retrying that early just earns another 429. The
+ * token reset is the honest number, so prefer it and let a small cushion cover
+ * clock skew and in-flight requests on the shared key.
+ */
+function providerRetryAfterSeconds(headers) {
+  const advertised = Number(headers.get('retry-after'))
+  const resetHeader = headers.get('x-ratelimit-reset-tokens') || headers.get('x-ratelimit-reset-requests')
+  const resetSeconds = parseDuration(resetHeader)
+  const wait = Math.max(Number.isFinite(advertised) ? advertised : 0, resetSeconds)
+  if (!Number.isFinite(wait) || wait <= 0) return 5 // provider sent nothing usable
+  return Math.min(Math.ceil(wait + 2), 20) // capped at 20s: this is a hack, not a fix
+}
+
+/** Parse the provider's reset notation, e.g. "30.757s", "5m45.6s", "1m2s" */
+function parseDuration(value) {
+  if (!value) return 0
+  const match = /^(?:(\d+)m)?(?:([\d.]+)s)?$/.exec(value.trim())
+  if (!match) return 0
+  return Number(match[1] || 0) * 60 + Number(match[2] || 0)
+}
+
+/**
+ * Resolved model names. The extension asks for a model that may not exist on
+ * whichever provider is configured, and a wrong name fails the whole request,
+ * so accept the common aliases and map them to what the provider serves.
+ */
 function resolveModel(requested) {
   if (typeof requested !== 'string' || !requested) return DEFAULT_MODEL
   if (ALLOWED_MODELS.has(requested)) return requested
@@ -439,12 +470,10 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   // A 429 here is the LLM provider throttling the shared key, not the user's own
   // plan quota (that case is handled above, before we ever reach the provider).
-  // The client needs retry-after to back off for the right amount of time, or to
-  // fall back to a wait of its choosing when the provider does not send one.
+  // The client needs a usable Retry-After, or it falls back to a wait of its own
+  // choosing and may retry too early.
   if (upstream.status === 429) {
-    if (!upstream.headers.get('retry-after')) {
-      res.setHeader('Retry-After', '2')
-    }
+    res.setHeader('Retry-After', String(providerRetryAfterSeconds(upstream.headers)))
     res.setHeader('X-Sidekick-Rate-Limit', 'provider')
   }
 
