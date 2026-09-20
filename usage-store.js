@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js'
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
-const TABLE = 'clickyweb_usage'
+const TABLE = 'sidekick_usage'
 const PERIOD_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) : null
@@ -63,7 +63,7 @@ function memSetPlan(installId, plan, subscriptionId, customerId, bySubscriptionI
 // ---- Supabase implementation ----
 // Expected table (run once in the Supabase SQL editor):
 //
-// create table clickyweb_usage (
+// create table sidekick_usage (
 //   install_id text primary key,
 //   plan text not null default 'free',
 //   count int not null default 0,

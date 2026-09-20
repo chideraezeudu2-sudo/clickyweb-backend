@@ -197,8 +197,9 @@ app.post('/v1/vision-locate', async (req, res) => {
 })
 
 /**
- * The core proxy: forwards chat completion requests to OpenRouter using our own
- * server-held key, after checking the caller hasn't exceeded their plan's limit.
+ * The core proxy: forwards chat completion requests to the configured LLM provider
+ * using our own server-held key, after checking the caller hasn't exceeded their
+ * plan's limit.
  * Request/response shape is passed through untouched (including streaming), so
  * the extension's existing OpenAI-compatible client needs no format changes —
  * only the URL and the removal of a client-side key.
@@ -267,5 +268,5 @@ app.post('/v1/chat/completions', async (req, res) => {
 })
 
 app.listen(PORT, () => {
-  console.log(`ClickyWeb backend listening on port ${PORT}`)
+  console.log(`Sidekick AI backend listening on port ${PORT}`)
 })
