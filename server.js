@@ -437,6 +437,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     res.setHeader(key, value)
   }
 
+  // A 429 here is the LLM provider throttling the shared key, not the user's own
+  // plan quota (that case is handled above, before we ever reach the provider).
+  // The client needs retry-after to back off for the right amount of time, or to
+  // fall back to a wait of its choosing when the provider does not send one.
+  if (upstream.status === 429) {
+    if (!upstream.headers.get('retry-after')) {
+      res.setHeader('Retry-After', '2')
+    }
+    res.setHeader('X-Sidekick-Rate-Limit', 'provider')
+  }
+
   if (!upstream.body) {
     return res.end()
   }
